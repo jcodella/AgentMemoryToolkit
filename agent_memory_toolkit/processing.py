@@ -10,6 +10,7 @@ from __future__ import annotations
 import json as _json
 import logging
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -110,8 +111,17 @@ class ProcessingClient:
         req = urllib.request.Request(
             url, data=data, headers={"Content-Type": "application/json"}, method="POST"
         )
-        with urllib.request.urlopen(req) as resp:
-            start_response: dict[str, Any] = _json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req) as resp:
+                start_response: dict[str, Any] = _json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise ProcessingError(
+                f"Failed to start orchestration: HTTP {exc.code} {exc.reason}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ProcessingError(
+                f"Failed to reach orchestration endpoint: {exc.reason}"
+            ) from exc
 
         status_url = start_response.get("statusQueryGetUri")
         if not status_url:
@@ -126,8 +136,17 @@ class ProcessingClient:
         while time.monotonic() < deadline:
             time.sleep(poll_interval)
             status_req = urllib.request.Request(status_url, method="GET")
-            with urllib.request.urlopen(status_req) as resp:
-                status: dict[str, Any] = _json.loads(resp.read().decode("utf-8"))
+            try:
+                with urllib.request.urlopen(status_req) as resp:
+                    status: dict[str, Any] = _json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                raise ProcessingError(
+                    f"Failed to poll orchestration status: HTTP {exc.code} {exc.reason}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise ProcessingError(
+                    f"Failed to reach orchestration status endpoint: {exc.reason}"
+                ) from exc
 
             runtime_status = status.get("runtimeStatus", "")
             logger.debug("Poll runtimeStatus=%s", runtime_status)

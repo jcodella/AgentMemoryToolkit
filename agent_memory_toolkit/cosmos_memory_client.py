@@ -15,8 +15,13 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ._query_builder import _QueryBuilder
+from ._utils import (
+    _build_memory_query_builder,
+    _container_policies,
+    _validate_connection,
+    _validate_hybrid_search,
+)
 from .exceptions import (
-    ConfigurationError,
     CosmosNotConnectedError,
     CosmosOperationError,
     MemoryNotFoundError,
@@ -24,80 +29,6 @@ from .exceptions import (
 from .models import MemoryRecord
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-
-def _validate_connection(
-    endpoint: str | None,
-    credential: Any,
-    database: str,
-    container: str,
-) -> None:
-    """Raise :class:`ConfigurationError` if any required field is missing."""
-    if not endpoint:
-        raise ConfigurationError(parameter="endpoint")
-    if not credential:
-        raise ConfigurationError(parameter="credential")
-    if not database:
-        raise ConfigurationError(parameter="database")
-    if not container:
-        raise ConfigurationError(parameter="container")
-
-
-def _build_memory_query_builder(
-    *,
-    memory_id: Optional[str] = None,
-    user_id: Optional[str] = None,
-    thread_id: Optional[str] = None,
-    role: Optional[str] = None,
-    memory_type: Optional[str] = None,
-) -> _QueryBuilder:
-    """Return a :class:`_QueryBuilder` pre-loaded with the standard filters."""
-    qb = _QueryBuilder()
-    qb.add_filter("c.id", "@memory_id", memory_id)
-    qb.add_filter("c.user_id", "@user_id", user_id)
-    qb.add_filter("c.thread_id", "@thread_id", thread_id)
-    qb.add_filter("c.role", "@role", role)
-    qb.add_filter("c.type", "@memory_type", memory_type)
-    return qb
-
-
-def _container_policies(
-    *,
-    embedding_dimensions: int,
-    embedding_data_type: str,
-    distance_function: str,
-    full_text_language: str,
-) -> tuple[dict, dict, dict]:
-    """Build the vector, indexing, and full-text policies for container creation."""
-    vector_embedding_policy = {
-        "vectorEmbeddings": [
-            {
-                "path": "/embedding",
-                "dataType": embedding_data_type,
-                "distanceFunction": distance_function,
-                "dimensions": embedding_dimensions,
-            }
-        ]
-    }
-
-    indexing_policy = {
-        "includedPaths": [{"path": "/*"}],
-        "excludedPaths": [{"path": "/embedding/*"}],
-        "vectorIndexes": [{"path": "/embedding", "type": "quantizedFlat"}],
-        "fullTextIndexes": [{"path": "/content"}],
-    }
-
-    full_text_policy = {
-        "defaultLanguage": full_text_language,
-        "fullTextPaths": [{"path": "/content", "language": full_text_language}],
-    }
-
-    return vector_embedding_policy, indexing_policy, full_text_policy
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +62,24 @@ class CosmosMemoryStore:
         self._credential = credential
         self._database = database
         self._container = container
+        self._cosmos_client: Any = None
         self._container_client: Any = None
+
+    # -- context manager ----------------------------------------------------
+
+    def __enter__(self) -> CosmosMemoryStore:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the underlying Cosmos client."""
+        if self._cosmos_client is not None:
+            self._cosmos_client.close()
+            self._cosmos_client = None
+            self._container_client = None
+            logger.info("Cosmos client closed")
 
     # -- connection ---------------------------------------------------------
 
@@ -156,7 +104,10 @@ class CosmosMemoryStore:
                 self._endpoint, credential=self._credential
             )
             db = client.get_database_client(self._database)
-            self._container_client = db.get_container_client(self._container)
+            container = db.get_container_client(self._container)
+
+            self._cosmos_client = client
+            self._container_client = container
         except Exception as exc:
             raise CosmosOperationError(
                 f"Failed to connect to Cosmos DB: {exc}"
@@ -225,6 +176,7 @@ class CosmosMemoryStore:
                     auto_scale_max_throughput=autoscale_max_ru,
                 ),
             )
+            self._cosmos_client = client
             self._container_client = container
         except Exception as exc:
             raise CosmosOperationError(
@@ -511,6 +463,7 @@ class CosmosMemoryStore:
             Required when *hybrid_search* is ``True``.
         """
         self._require_connected()
+        _validate_hybrid_search(hybrid_search, search_terms)
 
         qb = _build_memory_query_builder(
             user_id=user_id, role=role, memory_type=memory_type, thread_id=thread_id

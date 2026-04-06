@@ -228,11 +228,17 @@ def _call_llm_with_retry(
             raise
 
 
-def _generate_embedding(text: str) -> list[float]:
-    """Generate an embedding for *text* with error handling.
+def _generate_embedding(
+    text: str,
+    *,
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+) -> list[float]:
+    """Generate an embedding for *text* with retry logic.
 
     Uses the shared ``AzureOpenAI`` client, embedding model, and
-    dimensions from environment variables.
+    dimensions from environment variables.  Retries on rate-limit and
+    transient API errors with exponential backoff.
     """
     import openai
 
@@ -240,20 +246,99 @@ def _generate_embedding(text: str) -> list[float]:
     dimensions = _get_embedding_dimensions()
     client = _get_openai_client()
 
-    try:
-        response = client.embeddings.create(
-            input=[text], model=model, dimensions=dimensions,
-        )
-        return response.data[0].embedding
-    except openai.RateLimitError:
-        logger.warning("Embedding rate-limited model=%s", model)
-        raise
-    except openai.APIError as exc:
-        logger.error("Embedding API error model=%s: %s", model, exc, exc_info=True)
-        raise
-    except Exception as exc:
-        logger.error("Embedding call failed model=%s: %s", model, exc, exc_info=True)
-        raise
+    for attempt in range(max_retries):
+        try:
+            response = client.embeddings.create(
+                input=[text], model=model, dimensions=dimensions,
+            )
+            return response.data[0].embedding
+        except openai.RateLimitError as exc:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "Embedding rate-limited (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1, max_retries, delay, exc,
+                )
+                time.sleep(delay)
+                continue
+            logger.warning("Embedding rate-limited after %d attempts, re-raising", max_retries)
+            raise
+        except openai.APIError as exc:
+            status = getattr(exc, "status_code", None)
+            if status in _RETRYABLE_STATUS_CODES and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "Embedding API error %s (attempt %d/%d), retrying in %.1fs: %s",
+                    status, attempt + 1, max_retries, delay, exc,
+                )
+                time.sleep(delay)
+                continue
+            logger.error("Embedding API error (status=%s): %s", status, exc, exc_info=True)
+            raise
+        except Exception as exc:
+            logger.error("Embedding call failed model=%s: %s", model, exc, exc_info=True)
+            raise
+
+    # Should not be reached, but satisfy type checkers
+    raise RuntimeError("Embedding generation failed after all retries")
+
+
+def _generate_embeddings_batch(
+    texts: list[str],
+    *,
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+) -> list[list[float]]:
+    """Generate embeddings for multiple texts in a single API call.
+
+    Uses the OpenAI batch embedding API to reduce latency and rate-limit
+    pressure compared to sequential per-text calls.
+    """
+    import openai
+
+    if not texts:
+        return []
+
+    model = _get_embedding_model()
+    dimensions = _get_embedding_dimensions()
+    client = _get_openai_client()
+
+    for attempt in range(max_retries):
+        try:
+            response = client.embeddings.create(
+                input=texts, model=model, dimensions=dimensions,
+            )
+            # Sort by index to preserve input order
+            sorted_data = sorted(response.data, key=lambda d: d.index)
+            return [d.embedding for d in sorted_data]
+        except openai.RateLimitError as exc:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "Batch embedding rate-limited (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1, max_retries, delay, exc,
+                )
+                time.sleep(delay)
+                continue
+            logger.warning("Batch embedding rate-limited after %d attempts, re-raising", max_retries)
+            raise
+        except openai.APIError as exc:
+            status = getattr(exc, "status_code", None)
+            if status in _RETRYABLE_STATUS_CODES and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "Batch embedding API error %s (attempt %d/%d), retrying in %.1fs: %s",
+                    status, attempt + 1, max_retries, delay, exc,
+                )
+                time.sleep(delay)
+                continue
+            logger.error("Batch embedding API error (status=%s): %s", status, exc, exc_info=True)
+            raise
+        except Exception as exc:
+            logger.error("Batch embedding call failed model=%s: %s", model, exc, exc_info=True)
+            raise
+
+    raise RuntimeError("Batch embedding generation failed after all retries")
 
 
 # =====================================================================
@@ -618,13 +703,13 @@ def extract_facts(payload: dict) -> dict:
     if not fact_lines:
         fact_lines = [facts_text.strip()]
 
-    # ---- 5. Generate embeddings and store each fact ----
+    # ---- 5. Generate embeddings in batch and store each fact ----
     logger.info("extract_facts generating embeddings for %d facts", len(fact_lines))
     now = datetime.now(timezone.utc).isoformat()
+    fact_embeddings = _generate_embeddings_batch(fact_lines)
     facts_docs = []
 
-    for fact in fact_lines:
-        fact_embedding = _generate_embedding(fact)
+    for fact, fact_embedding in zip(fact_lines, fact_embeddings):
 
         fact_doc = {
             "id": str(uuid.uuid4()),

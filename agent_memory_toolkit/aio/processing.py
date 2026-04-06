@@ -112,10 +112,18 @@ class AsyncProcessingClient:
 
         logger.debug("POST %s with payload %s", url, payload)
 
+        import aiohttp
+
         session = await self._get_session()
 
-        async with session.post(url, json=payload) as resp:
-            start_response: dict[str, Any] = await resp.json()
+        try:
+            async with session.post(url, json=payload) as resp:
+                resp.raise_for_status()
+                start_response: dict[str, Any] = await resp.json()
+        except aiohttp.ClientError as exc:
+            raise ProcessingError(
+                f"Failed to start orchestration: {exc}"
+            ) from exc
 
         status_url = start_response.get("statusQueryGetUri")
         if not status_url:
@@ -130,8 +138,14 @@ class AsyncProcessingClient:
         deadline = loop.time() + timeout
         while loop.time() < deadline:
             await asyncio.sleep(poll_interval)
-            async with session.get(status_url) as resp:
-                status: dict[str, Any] = await resp.json()
+            try:
+                async with session.get(status_url) as resp:
+                    resp.raise_for_status()
+                    status: dict[str, Any] = await resp.json()
+            except aiohttp.ClientError as exc:
+                raise ProcessingError(
+                    f"Failed to poll orchestration status: {exc}"
+                ) from exc
 
             runtime_status = status.get("runtimeStatus", "")
             logger.debug("Poll runtimeStatus=%s", runtime_status)

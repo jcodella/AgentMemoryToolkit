@@ -7,63 +7,17 @@ CRUD, vector search, and Azure Durable Functions processing.
 
 import logging
 import os
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .cosmos_memory_client import CosmosMemoryStore
 from .embeddings import EmbeddingsClient
-from .exceptions import CosmosNotConnectedError
+from .exceptions import CosmosNotConnectedError, MemoryNotFoundError, ValidationError
 from .models import MemoryRecord
 from .processing import ProcessingClient
+from ._utils import VALID_ROLES, VALID_TYPES, _make_memory, _resolve_embedding_dimensions
 
 logger = logging.getLogger(__name__)
-
-
-VALID_ROLES = {"agent", "user", "tool", "system"}
-VALID_TYPES = {"turn", "summary", "fact", "user_summary"}
-
-
-def _make_memory(
-    user_id: str,
-    role: str,
-    content: str,
-    memory_type: str = "turn",
-    agent_id: Optional[str] = None,
-    metadata: Optional[dict[str, Any]] = None,
-    memory_id: Optional[str] = None,
-    thread_id: Optional[str] = None,
-) -> dict[str, Any]:
-    """Create a validated memory dict."""
-    if role not in VALID_ROLES:
-        raise ValueError(f"role must be one of {VALID_ROLES}, got '{role}'")
-    if memory_type not in VALID_TYPES:
-        raise ValueError(f"type must be one of {VALID_TYPES}, got '{memory_type}'")
-
-    memory = {
-        "id": memory_id or str(uuid.uuid4()),
-        "user_id": user_id,
-        "thread_id": thread_id or str(uuid.uuid4()),
-        "role": role,
-        "type": memory_type,
-        "content": content,
-        "metadata": metadata or {},
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    if agent_id is not None:
-        memory["agent_id"] = agent_id
-
-    return memory
-
-
-def _resolve_embedding_dimensions(val: Optional[int]) -> Optional[int]:
-    """Resolve embedding dimensions from explicit value or ``EMBEDDING_DIMENSIONS`` env var."""
-    if val is not None:
-        return val
-    raw = os.environ.get("EMBEDDING_DIMENSIONS", "0") or "0"
-    parsed = int(raw)
-    return parsed if parsed else None
 
 
 class AgentMemory:
@@ -233,7 +187,12 @@ class AgentMemory:
 
         Only the fields that are provided (not ``None``) will be updated.
 
-        Raises ``KeyError`` if no memory with the given id exists.
+        Raises
+        ------
+        MemoryNotFoundError
+            If no memory with the given id exists.
+        ValidationError
+            If an invalid role or memory_type is provided.
         """
         for memory in self.local_memory:
             if memory["id"] == memory_id:
@@ -241,30 +200,33 @@ class AgentMemory:
                     memory["content"] = content
                 if role is not None:
                     if role not in VALID_ROLES:
-                        raise ValueError(f"role must be one of {VALID_ROLES}, got '{role}'")
+                        raise ValidationError(f"role must be one of {VALID_ROLES}, got '{role}'")
                     memory["role"] = role
                 if memory_type is not None:
                     if memory_type not in VALID_TYPES:
-                        raise ValueError(f"type must be one of {VALID_TYPES}, got '{memory_type}'")
+                        raise ValidationError(f"type must be one of {VALID_TYPES}, got '{memory_type}'")
                     memory["type"] = memory_type
                 if metadata is not None:
                     memory["metadata"] = metadata
                 memory["updated_at"] = datetime.now(timezone.utc).isoformat()
                 return
 
-        raise KeyError(f"No memory found with id '{memory_id}'")
+        raise MemoryNotFoundError(memory_id=memory_id)
 
     def delete_local(self, memory_id: str) -> None:
         """Delete a memory from the local store by id.
 
-        Raises ``KeyError`` if no memory with the given id exists.
+        Raises
+        ------
+        MemoryNotFoundError
+            If no memory with the given id exists.
         """
         for i, memory in enumerate(self.local_memory):
             if memory["id"] == memory_id:
                 self.local_memory.pop(i)
                 return
 
-        raise KeyError(f"No memory found with id '{memory_id}'")
+        raise MemoryNotFoundError(memory_id=memory_id)
 
     # ------------------------------------------------------------------
     # Cosmos DB connection
@@ -350,17 +312,18 @@ class AgentMemory:
     ) -> None:
         """Add a memory to Cosmos DB."""
         self._require_cosmos()
-        memory = _make_memory(
-            user_id=user_id,
-            role=role,
-            content=content,
-            memory_type=memory_type,
-            metadata=metadata,
-            thread_id=thread_id,
-        )
-        record = MemoryRecord.from_cosmos_dict(memory)
+        kwargs: dict[str, Any] = {
+            "user_id": user_id,
+            "role": role,
+            "content": content,
+            "memory_type": memory_type,
+            "metadata": metadata or {},
+        }
+        if thread_id is not None:
+            kwargs["thread_id"] = thread_id
+        record = MemoryRecord(**kwargs)
         self._cosmos_store.upsert(record)
-        logger.info("add_cosmos id=%s role=%s type=%s", memory["id"], role, memory_type)
+        logger.info("add_cosmos id=%s role=%s type=%s", record.id, role, memory_type)
 
     def push_to_cosmos(self) -> None:
         """Insert all local memories into Cosmos DB.
@@ -457,10 +420,14 @@ class AgentMemory:
         """
         self._require_cosmos()
         logger.info(
-            "search_cosmos search_terms=%s top_k=%d hybrid_search=%s",
-            search_terms[:50] + "..." if len(search_terms) > 50 else search_terms,
+            "search_cosmos terms_len=%d top_k=%d hybrid_search=%s",
+            len(search_terms),
             top_k,
             hybrid_search,
+        )
+        logger.debug(
+            "search_cosmos search_terms=%s",
+            search_terms[:50] + "..." if len(search_terms) > 50 else search_terms,
         )
         query_vector = self._embeddings_client.generate(search_terms)
         results = self._cosmos_store.vector_search(
@@ -478,8 +445,8 @@ class AgentMemory:
             results = [r for r in results if r.get("id") == memory_id]
         if not results:
             logger.warning(
-                "search_cosmos returned empty results for search_terms=%s",
-                search_terms[:50] + "..." if len(search_terms) > 50 else search_terms,
+                "search_cosmos returned empty results (terms_len=%d)",
+                len(search_terms),
             )
         return results
 

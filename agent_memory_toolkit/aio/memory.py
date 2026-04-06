@@ -18,8 +18,8 @@ from typing import Any, Optional
 from agent_memory_toolkit.aio.cosmos_memory_client import AsyncCosmosMemoryStore
 from agent_memory_toolkit.aio.embeddings import AsyncEmbeddingsClient
 from agent_memory_toolkit.aio.processing import AsyncProcessingClient
-from agent_memory_toolkit.exceptions import CosmosNotConnectedError
-from agent_memory_toolkit.memory import VALID_ROLES, VALID_TYPES, _make_memory, _resolve_embedding_dimensions
+from agent_memory_toolkit.exceptions import CosmosNotConnectedError, MemoryNotFoundError, ValidationError
+from agent_memory_toolkit._utils import VALID_ROLES, VALID_TYPES, _make_memory, _resolve_embedding_dimensions
 from agent_memory_toolkit.models import MemoryRecord
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,7 @@ class AsyncAgentMemory:
         self._adf_key = adf_key
 
         # Resolve credentials via async DefaultAzureCredential when needed
+        self._owns_credential = False
         if use_default_credential:
             needs_cosmos = self._cosmos_credential is None
             needs_embed = self._ai_foundry_credential is None
@@ -83,6 +84,7 @@ class AsyncAgentMemory:
                 try:
                     from azure.identity.aio import DefaultAzureCredential
                     _default = DefaultAzureCredential()
+                    self._owns_credential = True
                 except ImportError:
                     _default = None
                 if needs_cosmos:
@@ -122,6 +124,10 @@ class AsyncAgentMemory:
             await self._cosmos_store.close()
         await self._embeddings_client.close()
         await self._processing_client.close()
+        if self._owns_credential and self._cosmos_credential is not None:
+            close = getattr(self._cosmos_credential, "close", None)
+            if close is not None:
+                await close()
         logger.info("AsyncAgentMemory closed")
 
     # ------------------------------------------------------------------
@@ -192,7 +198,12 @@ class AsyncAgentMemory:
 
         Only the fields that are provided (not ``None``) will be updated.
 
-        Raises ``KeyError`` if no memory with the given id exists.
+        Raises
+        ------
+        MemoryNotFoundError
+            If no memory with the given id exists.
+        ValidationError
+            If an invalid role or memory_type is provided.
         """
         for memory in self.local_memory:
             if memory["id"] == memory_id:
@@ -200,30 +211,33 @@ class AsyncAgentMemory:
                     memory["content"] = content
                 if role is not None:
                     if role not in VALID_ROLES:
-                        raise ValueError(f"role must be one of {VALID_ROLES}, got '{role}'")
+                        raise ValidationError(f"role must be one of {VALID_ROLES}, got '{role}'")
                     memory["role"] = role
                 if memory_type is not None:
                     if memory_type not in VALID_TYPES:
-                        raise ValueError(f"type must be one of {VALID_TYPES}, got '{memory_type}'")
+                        raise ValidationError(f"type must be one of {VALID_TYPES}, got '{memory_type}'")
                     memory["type"] = memory_type
                 if metadata is not None:
                     memory["metadata"] = metadata
                 memory["updated_at"] = datetime.now(timezone.utc).isoformat()
                 return
 
-        raise KeyError(f"No memory found with id '{memory_id}'")
+        raise MemoryNotFoundError(memory_id=memory_id)
 
     def delete_local(self, memory_id: str) -> None:
         """Delete a memory from the local store by id.
 
-        Raises ``KeyError`` if no memory with the given id exists.
+        Raises
+        ------
+        MemoryNotFoundError
+            If no memory with the given id exists.
         """
         for i, memory in enumerate(self.local_memory):
             if memory["id"] == memory_id:
                 self.local_memory.pop(i)
                 return
 
-        raise KeyError(f"No memory found with id '{memory_id}'")
+        raise MemoryNotFoundError(memory_id=memory_id)
 
     # ------------------------------------------------------------------
     # Cosmos DB connection (async)
@@ -309,17 +323,18 @@ class AsyncAgentMemory:
     ) -> None:
         """Add a memory to Cosmos DB."""
         self._require_cosmos()
-        memory = _make_memory(
-            user_id=user_id,
-            role=role,
-            content=content,
-            memory_type=memory_type,
-            metadata=metadata,
-            thread_id=thread_id,
-        )
-        record = MemoryRecord.from_cosmos_dict(memory)
+        kwargs: dict[str, Any] = {
+            "user_id": user_id,
+            "role": role,
+            "content": content,
+            "memory_type": memory_type,
+            "metadata": metadata or {},
+        }
+        if thread_id is not None:
+            kwargs["thread_id"] = thread_id
+        record = MemoryRecord(**kwargs)
         await self._cosmos_store.upsert(record)
-        logger.info("add_cosmos id=%s role=%s type=%s", memory["id"], role, memory_type)
+        logger.info("add_cosmos id=%s role=%s type=%s", record.id, role, memory_type)
 
     async def push_to_cosmos(self, batch_size: int = 25) -> None:
         """Insert all local memories into Cosmos DB in concurrent batches.
@@ -412,10 +427,14 @@ class AsyncAgentMemory:
         """
         self._require_cosmos()
         logger.info(
-            "search_cosmos search_terms=%s top_k=%d hybrid_search=%s",
-            search_terms[:50] + "..." if len(search_terms) > 50 else search_terms,
+            "search_cosmos terms_len=%d top_k=%d hybrid_search=%s",
+            len(search_terms),
             top_k,
             hybrid_search,
+        )
+        logger.debug(
+            "search_cosmos search_terms=%s",
+            search_terms[:50] + "..." if len(search_terms) > 50 else search_terms,
         )
         query_vector = await self._embeddings_client.generate(search_terms)
         results = await self._cosmos_store.vector_search(
@@ -433,8 +452,8 @@ class AsyncAgentMemory:
             results = [r for r in results if r.get("id") == memory_id]
         if not results:
             logger.warning(
-                "search_cosmos returned empty results for search_terms=%s",
-                search_terms[:50] + "..." if len(search_terms) > 50 else search_terms,
+                "search_cosmos returned empty results (terms_len=%d)",
+                len(search_terms),
             )
         return results
 

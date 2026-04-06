@@ -15,8 +15,13 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from agent_memory_toolkit._query_builder import _QueryBuilder
+from agent_memory_toolkit._utils import (
+    _build_memory_query_builder,
+    _container_policies,
+    _validate_connection,
+    _validate_hybrid_search,
+)
 from agent_memory_toolkit.exceptions import (
-    ConfigurationError,
     CosmosNotConnectedError,
     CosmosOperationError,
     MemoryNotFoundError,
@@ -24,29 +29,6 @@ from agent_memory_toolkit.exceptions import (
 from agent_memory_toolkit.models import MemoryRecord
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_memory_query_builder(
-    *,
-    memory_id: Optional[str] = None,
-    user_id: Optional[str] = None,
-    thread_id: Optional[str] = None,
-    role: Optional[str] = None,
-    memory_type: Optional[str] = None,
-) -> _QueryBuilder:
-    """Return a :class:`_QueryBuilder` pre-loaded with standard filters."""
-    qb = _QueryBuilder()
-    qb.add_filter("c.id", "@memory_id", memory_id)
-    qb.add_filter("c.user_id", "@user_id", user_id)
-    qb.add_filter("c.thread_id", "@thread_id", thread_id)
-    qb.add_filter("c.role", "@role", role)
-    qb.add_filter("c.type", "@memory_type", memory_type)
-    return qb
 
 
 # ---------------------------------------------------------------------------
@@ -102,19 +84,21 @@ class AsyncCosmosMemoryStore:
         CosmosOperationError
             If the connection fails.
         """
-        if not self._endpoint:
-            raise ConfigurationError(parameter="endpoint")
-        if not self._credential:
-            raise ConfigurationError(parameter="credential")
+        _validate_connection(
+            self._endpoint, self._credential, self._database, self._container
+        )
 
         try:
             from azure.cosmos.aio import CosmosClient
 
-            self._cosmos_client = CosmosClient(
+            client = CosmosClient(
                 self._endpoint, credential=self._credential
             )
-            db = self._cosmos_client.get_database_client(self._database)
-            self._container_client = db.get_container_client(self._container)
+            db = client.get_database_client(self._database)
+            container = db.get_container_client(self._container)
+
+            self._cosmos_client = client
+            self._container_client = container
         except Exception as exc:
             raise CosmosOperationError(
                 f"Failed to connect to Cosmos DB (async): {exc}"
@@ -143,20 +127,19 @@ class AsyncCosmosMemoryStore:
         * Full-text index on ``/content``
         * Autoscale throughput (max RU)
         """
-        if not self._endpoint:
-            raise ConfigurationError(parameter="endpoint")
-        if not self._credential:
-            raise ConfigurationError(parameter="credential")
+        _validate_connection(
+            self._endpoint, self._credential, self._database, self._container
+        )
 
         try:
             from azure.cosmos import PartitionKey, ThroughputProperties
             from azure.cosmos.aio import CosmosClient
 
-            self._cosmos_client = CosmosClient(
+            client = CosmosClient(
                 self._endpoint, credential=self._credential
             )
 
-            db = await self._cosmos_client.create_database_if_not_exists(
+            db = await client.create_database_if_not_exists(
                 id=self._database
             )
 
@@ -164,41 +147,24 @@ class AsyncCosmosMemoryStore:
                 path=["/user_id", "/thread_id"], kind="MultiHash"
             )
 
-            vector_embedding_policy = {
-                "vectorEmbeddings": [
-                    {
-                        "path": "/embedding",
-                        "dataType": embedding_data_type,
-                        "distanceFunction": distance_function,
-                        "dimensions": embedding_dimensions,
-                    }
-                ]
-            }
-
-            indexing_policy = {
-                "includedPaths": [{"path": "/*"}],
-                "excludedPaths": [{"path": "/embedding/*"}],
-                "vectorIndexes": [{"path": "/embedding", "type": "quantizedFlat"}],
-                "fullTextIndexes": [{"path": "/content"}],
-            }
-
-            full_text_policy = {
-                "defaultLanguage": full_text_language,
-                "fullTextPaths": [
-                    {"path": "/content", "language": full_text_language}
-                ],
-            }
+            vec_policy, idx_policy, ft_policy = _container_policies(
+                embedding_dimensions=embedding_dimensions,
+                embedding_data_type=embedding_data_type,
+                distance_function=distance_function,
+                full_text_language=full_text_language,
+            )
 
             container = await db.create_container_if_not_exists(
                 id=self._container,
                 partition_key=partition_key,
-                indexing_policy=indexing_policy,
-                vector_embedding_policy=vector_embedding_policy,
-                full_text_policy=full_text_policy,
+                indexing_policy=idx_policy,
+                vector_embedding_policy=vec_policy,
+                full_text_policy=ft_policy,
                 offer_throughput=ThroughputProperties(
                     auto_scale_max_throughput=autoscale_max_ru,
                 ),
             )
+            self._cosmos_client = client
             self._container_client = container
         except Exception as exc:
             raise CosmosOperationError(
@@ -478,6 +444,7 @@ class AsyncCosmosMemoryStore:
             Required when *hybrid_search* is ``True``.
         """
         self._require_connected()
+        _validate_hybrid_search(hybrid_search, search_terms)
 
         qb = _build_memory_query_builder(
             user_id=user_id, role=role, memory_type=memory_type, thread_id=thread_id

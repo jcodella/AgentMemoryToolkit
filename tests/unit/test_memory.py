@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent_memory_toolkit.exceptions import CosmosNotConnectedError
+from agent_memory_toolkit.exceptions import CosmosNotConnectedError, MemoryNotFoundError, ValidationError
 from agent_memory_toolkit.memory import AgentMemory
 from agent_memory_toolkit.models import MemoryRecord
 
@@ -69,7 +69,7 @@ class TestAddLocal:
 
     def test_add_local_invalid_role(self):
         mem = _make_agent()
-        with pytest.raises(ValueError, match="role must be one of"):
+        with pytest.raises(ValidationError, match="role must be one of"):
             mem.add_local(user_id="u1", role="invalid", content="hi")
 
 
@@ -113,7 +113,7 @@ class TestUpdateLocal:
 
     def test_update_local_not_found(self):
         mem = _make_agent()
-        with pytest.raises(KeyError, match="No memory found"):
+        with pytest.raises(MemoryNotFoundError):
             mem.update_local("nonexistent-id", content="x")
 
 
@@ -130,7 +130,7 @@ class TestDeleteLocal:
 
     def test_delete_local_not_found(self):
         mem = _make_agent()
-        with pytest.raises(KeyError, match="No memory found"):
+        with pytest.raises(MemoryNotFoundError):
             mem.delete_local("nonexistent-id")
 
 

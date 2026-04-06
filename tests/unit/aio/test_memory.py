@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agent_memory_toolkit.aio.memory import AsyncAgentMemory
-from agent_memory_toolkit.exceptions import CosmosNotConnectedError
+from agent_memory_toolkit.exceptions import CosmosNotConnectedError, MemoryNotFoundError, ValidationError
 from agent_memory_toolkit.models import MemoryRecord
 
 # ---------------------------------------------------------------------------
@@ -99,12 +99,12 @@ async def test_add_local_all_fields(memory):
 
 
 async def test_add_local_invalid_role(memory):
-    with pytest.raises(ValueError, match="role must be one of"):
+    with pytest.raises(ValidationError, match="role must be one of"):
         memory.add_local(user_id="u1", role="invalid", content="hi")
 
 
 async def test_add_local_invalid_type(memory):
-    with pytest.raises(ValueError, match="type must be one of"):
+    with pytest.raises(ValidationError, match="type must be one of"):
         memory.add_local(user_id="u1", role="user", content="hi", memory_type="bad")
 
 
@@ -159,7 +159,7 @@ async def test_update_local_success(memory):
 
 
 async def test_update_local_not_found(memory):
-    with pytest.raises(KeyError, match="No memory found"):
+    with pytest.raises(MemoryNotFoundError):
         memory.update_local(memory_id="nonexistent", content="x")
 
 
@@ -187,7 +187,7 @@ async def test_delete_local_success(memory):
 
 
 async def test_delete_local_not_found(memory):
-    with pytest.raises(KeyError, match="No memory found"):
+    with pytest.raises(MemoryNotFoundError):
         memory.delete_local("nonexistent")
 
 
