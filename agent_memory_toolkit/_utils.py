@@ -69,6 +69,94 @@ def _resolve_embedding_dimensions(val: Optional[int]) -> Optional[int]:
     return parsed if parsed else None
 
 
+def _resolve_cosmos_throughput_mode(val: Optional[str]) -> str:
+    """Resolve throughput mode from explicit value or env var.
+
+    Allowed values are ``serverless`` and ``autoscale``.
+    """
+    raw = (val if val is not None else os.environ.get("COSMOS_DB_THROUGHPUT_MODE") or "serverless").strip().lower()
+
+    if raw not in {"serverless", "autoscale"}:
+        raise ConfigurationError(
+            message=(
+                f"Invalid configuration for cosmos_throughput_mode: expected 'serverless' or 'autoscale', got '{raw}'"
+            ),
+            parameter="cosmos_throughput_mode",
+        )
+    return raw
+
+
+def _resolve_cosmos_autoscale_max_ru(val: Optional[int]) -> int:
+    """Resolve autoscale max RU from explicit value or env var."""
+    if val is not None:
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            raise ConfigurationError(
+                message=f"Invalid configuration for cosmos_autoscale_max_ru: expected a positive integer, got '{val}'",
+                parameter="cosmos_autoscale_max_ru",
+            )
+        return val
+    raw = (os.environ.get("COSMOS_DB_AUTOSCALE_MAX_RU") or "1000").strip()
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(
+            message=(f"Invalid configuration for cosmos_autoscale_max_ru: expected an integer, got '{raw}'"),
+            parameter="cosmos_autoscale_max_ru",
+        ) from exc
+    if parsed <= 0:
+        raise ConfigurationError(
+            message=(f"Invalid configuration for cosmos_autoscale_max_ru: expected a positive integer, got '{raw}'"),
+            parameter="cosmos_autoscale_max_ru",
+        )
+    return parsed
+
+
+def _resolve_cosmos_provisioning_autoscale_max_ru(
+    *,
+    throughput_mode: str,
+    autoscale_max_ru: Optional[int],
+) -> Optional[int]:
+    """Resolve autoscale max RU only when autoscale throughput is enabled."""
+    if throughput_mode != "autoscale":
+        return None
+    return _resolve_cosmos_autoscale_max_ru(autoscale_max_ru)
+
+
+def _cosmos_container_offer_throughput(
+    *,
+    throughput_mode: str,
+    autoscale_max_ru: Optional[int],
+    throughput_properties_cls: Any,
+) -> Any:
+    """Return ``None`` for serverless mode or a throughput properties instance for autoscale mode."""
+    if throughput_mode == "serverless":
+        return None
+    if autoscale_max_ru is None:
+        raise ConfigurationError(
+            message=("Invalid configuration for cosmos_autoscale_max_ru: autoscale mode requires a positive integer"),
+            parameter="cosmos_autoscale_max_ru",
+        )
+    return throughput_properties_cls(auto_scale_max_throughput=autoscale_max_ru)
+
+
+def _build_container_kwargs(
+    *,
+    container_id: str,
+    partition_key: Any,
+    offer_throughput: Optional[Any],
+    **extras: Any,
+) -> dict[str, Any]:
+    """Build kwargs for ``create_container_if_not_exists`` with optional throughput."""
+    kwargs: dict[str, Any] = {
+        "id": container_id,
+        "partition_key": partition_key,
+        **extras,
+    }
+    if offer_throughput is not None:
+        kwargs["offer_throughput"] = offer_throughput
+    return kwargs
+
+
 # ---------------------------------------------------------------------------
 # Connection / query helpers (shared by sync & async Cosmos clients)
 # ---------------------------------------------------------------------------
