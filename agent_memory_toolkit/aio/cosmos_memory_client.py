@@ -113,7 +113,7 @@ class AsyncCosmosMemoryClient:
     ) -> None:
         # Local store
         self.local_memory: list[dict[str, Any]] = []
-        self._unflushed_turn_counts: dict[tuple[str, Optional[str]], int] = {}
+        self._unflushed_turn_counts: dict[tuple[str, str], int] = {}
 
         self._background_tasks: set[asyncio.Task[Any]] = set()
         try:
@@ -361,6 +361,11 @@ class AsyncCosmosMemoryClient:
             ttl=ttl,
             salience=salience,
         )
+        if memory_type == "turn" and not thread_id:
+            raise ValidationError(
+                "thread_id is required for memory_type='turn' so the auto-trigger "
+                "counter can group turns per conversation. Set thread_id explicitly."
+            )
         self.local_memory.append(memory)
         if memory_type == "turn":
             key = (user_id, thread_id)
@@ -491,6 +496,8 @@ class AsyncCosmosMemoryClient:
         try:
             from azure.cosmos.aio import CosmosClient
 
+            await self._drain_cosmos_client()
+
             client = CosmosClient(self._cosmos_endpoint, credential=self._cosmos_credential)
             db = client.get_database_client(self._cosmos_database)
             container_handle = db.get_container_client(self._cosmos_container)
@@ -572,6 +579,8 @@ class AsyncCosmosMemoryClient:
         try:
             from azure.cosmos import PartitionKey, ThroughputProperties
             from azure.cosmos.aio import CosmosClient
+
+            await self._drain_cosmos_client()
 
             client = CosmosClient(self._cosmos_endpoint, credential=self._cosmos_credential)
 
@@ -733,7 +742,34 @@ class AsyncCosmosMemoryClient:
 
         for start in range(0, len(records), batch_size):
             batch = records[start : start + batch_size]
-            tasks = [self._container_client.upsert_item(body=r.to_cosmos_dict()) for r in batch]
+            bodies = [r.to_cosmos_dict() for r in batch]
+
+            # Batch-embed non-turn memories that don't already carry a
+            # vector — one /embeddings POST per Cosmos batch instead of
+            # N concurrent ones.
+            to_embed_idx: list[int] = []
+            to_embed_text: list[str] = []
+            for i, body in enumerate(bodies):
+                if body.get("type") != "turn" and body.get("content") and not body.get("embedding"):
+                    to_embed_idx.append(i)
+                    to_embed_text.append(body["content"])
+            if to_embed_text:
+                try:
+                    vectors = await self._embeddings_client.generate_batch(to_embed_text)
+                    for i, vec in zip(to_embed_idx, vectors):
+                        bodies[i]["embedding"] = vec
+                        # Persist the embedding back to local_memory so a
+                        # repeat push_to_cosmos() doesn't re-embed.
+                        self.local_memory[start + i]["embedding"] = vec
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "push_to_cosmos: batch embedding generation failed (%s); "
+                        "proceeding without embeddings for %d records",
+                        exc,
+                        len(to_embed_text),
+                    )
+
+            tasks = [self._container_client.upsert_item(body=b) for b in bodies]
             try:
                 await asyncio.gather(*tasks)
             except Exception as exc:
@@ -1247,7 +1283,7 @@ class AsyncCosmosMemoryClient:
                 try:
                     close()
                 except Exception:
-                    pass
+                    logger.warning("Failed to close prior sync Cosmos client", exc_info=True)
             self._sync_cosmos_client = None
 
         prior_sync_embeddings = getattr(self, "_sync_embeddings_client", None)
@@ -1257,8 +1293,33 @@ class AsyncCosmosMemoryClient:
                 try:
                     close()
                 except Exception:
-                    pass
+                    logger.warning("Failed to close prior sync EmbeddingsClient", exc_info=True)
             self._sync_embeddings_client = None
+
+    async def _drain_cosmos_client(self) -> None:
+        """Close any prior async Cosmos client before reassigning the field.
+
+        Also nulls the cached pipeline, counter container handle, and any
+        lazily-created processor — otherwise they retain references to
+        the drained sync container client and the next op fails with an
+        opaque "Object disposed" error. A user-supplied processor is left
+        intact since the SDK does not own its lifecycle.
+        """
+        prior = self._cosmos_client
+        if prior is None:
+            return
+        close = getattr(prior, "close", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:
+                logger.warning("Failed to close prior async Cosmos client during reconnect", exc_info=True)
+        self._cosmos_client = None
+        self._container_client = None
+        self._counter_container_client = None
+        self._pipeline = None
+        if not self._processor_explicit:
+            self._processor = None
 
     def _init_pipeline(self) -> None:
         """Initialize the ProcessingPipeline with a sync container client.

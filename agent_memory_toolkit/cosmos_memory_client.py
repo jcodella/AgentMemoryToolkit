@@ -112,7 +112,7 @@ class CosmosMemoryClient:
     ) -> None:
         # Local store
         self.local_memory: list[dict[str, Any]] = []
-        self._unflushed_turn_counts: dict[tuple[str, Optional[str]], int] = {}
+        self._unflushed_turn_counts: dict[tuple[str, str], int] = {}
         self._warned_owner_skip: bool = False
         self._warned_counter_unreachable: bool = False
 
@@ -278,6 +278,11 @@ class CosmosMemoryClient:
             ttl=ttl,
             salience=salience,
         )
+        if memory_type == "turn" and not thread_id:
+            raise ValidationError(
+                "thread_id is required for memory_type='turn' so the auto-trigger "
+                "counter can group turns per conversation. Set thread_id explicitly."
+            )
         self.local_memory.append(memory)
         if memory_type == "turn":
             key = (user_id, thread_id)
@@ -408,6 +413,8 @@ class CosmosMemoryClient:
         try:
             from azure.cosmos import CosmosClient
 
+            self._drain_cosmos_client()
+
             client = CosmosClient(self._cosmos_endpoint, credential=self._cosmos_credential)
             db = client.get_database_client(self._cosmos_database)
             container_handle = db.get_container_client(self._cosmos_container)
@@ -489,6 +496,8 @@ class CosmosMemoryClient:
         try:
             from azure.cosmos import CosmosClient, PartitionKey, ThroughputProperties
 
+            self._drain_cosmos_client()
+
             client = CosmosClient(self._cosmos_endpoint, credential=self._cosmos_credential)
 
             db = client.create_database_if_not_exists(id=self._cosmos_database)
@@ -558,6 +567,28 @@ class CosmosMemoryClient:
             embeddings_client=self._embeddings_client,
         )
         self._warn_on_embedding_dim_mismatch()
+
+    def _drain_cosmos_client(self) -> None:
+        """Close any prior Cosmos client before reassigning the field.
+
+        Repeated ``connect_cosmos`` / ``create_memory_store`` calls on the
+        same instance must not leak the prior client's httpx pool / FDs.
+        """
+        prior = self._cosmos_client
+        if prior is None:
+            return
+        close = getattr(prior, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("Failed to close prior Cosmos client during reconnect", exc_info=True)
+        self._cosmos_client = None
+        self._container_client = None
+        self._counter_container_client = None
+        self._pipeline = None
+        if not self._processor_explicit:
+            self._processor = None
 
     def _warn_on_embedding_dim_mismatch(self) -> None:
         """Log a WARNING if the resolved embedding dim differs from the container's policy.
@@ -948,8 +979,34 @@ class CosmosMemoryClient:
         records = [MemoryRecord.from_cosmos_dict(dict(m)) for m in self.local_memory]
         for start in range(0, len(records), batch_size):
             batch = records[start : start + batch_size]
-            for record in batch:
-                body = record.to_cosmos_dict()
+            bodies = [r.to_cosmos_dict() for r in batch]
+
+            # Batch-embed non-turn memories that don't already carry a
+            # vector — one /embeddings POST per Cosmos batch instead of
+            # one per record.
+            to_embed_idx: list[int] = []
+            to_embed_text: list[str] = []
+            for i, body in enumerate(bodies):
+                if body.get("type") != "turn" and body.get("content") and not body.get("embedding"):
+                    to_embed_idx.append(i)
+                    to_embed_text.append(body["content"])
+            if to_embed_text:
+                try:
+                    vectors = self._embeddings_client.generate_batch(to_embed_text)
+                    for i, vec in zip(to_embed_idx, vectors):
+                        bodies[i]["embedding"] = vec
+                        # Persist the embedding back to local_memory so a
+                        # repeat push_to_cosmos() doesn't re-embed.
+                        self.local_memory[start + i]["embedding"] = vec
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "push_to_cosmos: batch embedding generation failed (%s); "
+                        "proceeding without embeddings for %d records",
+                        exc,
+                        len(to_embed_text),
+                    )
+
+            for record, body in zip(batch, bodies):
                 try:
                     self._container_client.upsert_item(body=body)
                 except Exception as exc:
