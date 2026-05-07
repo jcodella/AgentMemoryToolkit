@@ -51,7 +51,7 @@ class _FullAsyncDummy:
     ) -> UserSummaryResult:
         return UserSummaryResult()
 
-    async def process_dedup(
+    async def process_reconcile(
         self,
         *,
         user_id: str,

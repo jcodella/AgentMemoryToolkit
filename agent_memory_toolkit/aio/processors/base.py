@@ -49,7 +49,7 @@ class AsyncMemoryProcessor(Protocol):
         thread_ids: Optional[list[str]] = None,
     ) -> UserSummaryResult: ...
 
-    async def process_dedup(
+    async def process_reconcile(
         self,
         *,
         user_id: str,

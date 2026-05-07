@@ -9,16 +9,33 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import os
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from ._utils import DEFAULT_TTL_BY_TYPE, compute_content_hash
 from .exceptions import LLMError, ValidationError
 
 logger = logging.getLogger(__name__)
+
+# Separator for deterministic id seeds. Using NUL ensures user_id /
+# thread_id values can never collide with literal section markers
+# (e.g. a thread literally named ``"merged"`` cannot collide with the
+# reconcile-merge id namespace). Defined as a module constant because
+# escape sequences are not permitted inside f-strings on Python 3.11.
+_ID_SEED_SEP = "\x00"
+
+
+def _is_real_number(v: Any) -> bool:
+    """True for ``int``/``float`` excluding ``bool`` (``isinstance(True, int)`` is True)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _max_or_none(values: Any) -> Optional[float]:
+    """Return max of numeric values, ignoring None / non-numeric / bool. None if empty."""
+    nums = [float(v) for v in values if _is_real_number(v)]
+    return max(nums) if nums else None
 
 
 class ProcessingPipeline:
@@ -241,7 +258,7 @@ class ProcessingPipeline:
             f"SELECT TOP {limit} * FROM c "
             f"WHERE c.user_id = @user_id "
             f"AND c.type IN ({type_placeholders}) "
-            f"AND (NOT IS_DEFINED(c.superseded_by) OR c.superseded_by = null) "
+            f"AND (NOT IS_DEFINED(c.superseded_by) OR IS_NULL(c.superseded_by)) "
             f"ORDER BY c._ts DESC"
         )
         parameters: list[dict[str, Any]] = [
@@ -261,11 +278,23 @@ class ProcessingPipeline:
 
     def _upsert_memory(self, doc: dict[str, Any]) -> dict[str, Any]:
         """Upsert a single memory document to Cosmos DB."""
-        self._container.upsert_item(body=doc)
+        response = self._container.upsert_item(body=doc)
+        if isinstance(response, dict):
+            return response
         return doc
 
-    def _mark_superseded(self, old_doc: dict[str, Any], superseder_id: str) -> bool:
+    def _mark_superseded(
+        self,
+        old_doc: dict[str, Any],
+        superseder_id: str,
+        *,
+        reason: Literal["duplicate", "contradiction", "update"],
+    ) -> bool:
         """Atomically set ``superseded_by`` on ``old_doc`` using ETag protection.
+
+        Also stamps ``supersede_reason`` and ``superseded_at`` so apps can
+        distinguish a duplicate-collapse from a contradiction-resolution
+        from an extract-time refinement (``update``) at audit time.
 
         Supersession is advisory — losing a race here just means another writer
         already marked the same memory, so we log and return False instead of
@@ -280,7 +309,12 @@ class ProcessingPipeline:
         from azure.cosmos.exceptions import CosmosAccessConditionFailedError
 
         etag = old_doc.get("_etag")
-        new_doc = {**old_doc, "superseded_by": superseder_id}
+        new_doc = {
+            **old_doc,
+            "superseded_by": superseder_id,
+            "supersede_reason": reason,
+            "superseded_at": datetime.now(timezone.utc).isoformat(),
+        }
         try:
             if etag:
                 self._container.replace_item(
@@ -378,10 +412,32 @@ class ProcessingPipeline:
                 user_id,
                 thread_id,
             )
-            return {"facts_count": 0, "procedural_count": 0, "episodic_count": 0, "updated_count": 0}
+            return {
+                "facts_count": 0,
+                "procedural_count": 0,
+                "episodic_count": 0,
+                "unclassified_count": 0,
+                "updated_count": 0,
+                "exact_dedup_skipped": 0,
+            }
 
         # ---- 2. Load existing memories for reconciliation ----
         existing = self._load_existing_memories(user_id, ["fact", "procedural"])
+        # Pre-compute exact-content hashes from existing memories for the
+        # write-time short-circuit. Saves the embedding call and the upsert
+        # RU on identical re-extractions across runs.
+        #
+        # Hashes are bucketed *by type* — a fact with the same normalized
+        # text as an existing procedural must NOT be silently dropped, because
+        # they're semantically different memory kinds and the LLM's
+        # classification would be erased. Unclassified items are persisted as
+        # facts so they share the fact bucket.
+        existing_fact_hashes: set[str] = {
+            m["content_hash"] for m in existing if m.get("type") == "fact" and m.get("content_hash")
+        }
+        existing_proc_hashes: set[str] = {
+            m["content_hash"] for m in existing if m.get("type") == "procedural" and m.get("content_hash")
+        }
         existing_text = ""
         if existing:
             lines = []
@@ -413,6 +469,7 @@ class ProcessingPipeline:
         docs_to_embed: list[dict[str, Any]] = []
         embed_texts: list[str] = []
         updated_count = 0
+        exact_dedup_skipped = 0
 
         # ---- 5. Process facts ----
         for fact in facts:
@@ -427,8 +484,22 @@ class ProcessingPipeline:
                     fact,
                 )
                 continue
-            content_hash = compute_content_hash(text)
-            det_id = f"fact_{hashlib.sha256(f'{user_id}:{thread_id}:{content_hash}'.encode()).hexdigest()[:16]}"
+            # Write-time exact-dedup short-circuit. ADDs whose normalized
+            # content already exists are skipped before embedding/upsert.
+            # UPDATEs go through unchanged - they explicitly target an old
+            # record by id and need to write the supersession link.
+            new_content_hash = compute_content_hash(text)
+            if action == "ADD" and new_content_hash in existing_fact_hashes:
+                logger.debug(
+                    "extract_memories: skipping exact-dup fact hash=%s user_id=%s thread_id=%s",
+                    new_content_hash,
+                    user_id,
+                    thread_id,
+                )
+                exact_dedup_skipped += 1
+                continue
+            seed = _ID_SEED_SEP.join((user_id, thread_id, new_content_hash))
+            det_id = f"fact_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
 
             topic_tags = [f"topic:{t}" for t in fact.get("tags", [])]
             tags = ["sys:fact", "sys:auto-extracted"] + topic_tags
@@ -444,7 +515,7 @@ class ProcessingPipeline:
                 "role": "system",
                 "type": "fact",
                 "content": text,
-                "content_hash": content_hash,
+                "content_hash": new_content_hash,
                 "confidence": confidence,
                 "metadata": {
                     "category": fact.get("category"),
@@ -459,6 +530,20 @@ class ProcessingPipeline:
             }
 
             if action == "UPDATE" and fact.get("supersedes_id"):
+                # If the new content hashes to the same deterministic id
+                # as the target (UPDATE refines metadata but text is
+                # unchanged), the upsert below would overwrite the
+                # ``superseded_by``/``supersede_reason`` audit metadata
+                # we are about to stamp on the target — and the new doc
+                # would carry a self-referential ``supersedes_ids``
+                # entry. Treat as a no-op and let the existing record
+                # stand.
+                if det_id == fact["supersedes_id"]:
+                    logger.debug(
+                        "extract_memories: skipping UPDATE — det_id == supersedes_id (%s)",
+                        det_id,
+                    )
+                    continue
                 doc["supersedes_ids"] = [fact["supersedes_id"]]
                 # Mark old memory as superseded
                 try:
@@ -466,7 +551,17 @@ class ProcessingPipeline:
                         item=fact["supersedes_id"],
                         partition_key=[user_id, thread_id],
                     )
-                    if self._mark_superseded(old_mem, det_id):
+                    # Skip if the target was already retired by an earlier
+                    # extract or a reconcile cycle - re-superseding it
+                    # would clobber the prior ``superseded_by`` link and
+                    # narrow the audit chain.
+                    if old_mem.get("superseded_by"):
+                        logger.debug(
+                            "extract_memories: skipping UPDATE — target %s already superseded by %s",
+                            fact["supersedes_id"],
+                            old_mem.get("superseded_by"),
+                        )
+                    elif self._mark_superseded(old_mem, det_id, reason="update"):
                         updated_count += 1
                 except Exception:
                     # Try cross-partition query if direct read fails
@@ -475,7 +570,10 @@ class ProcessingPipeline:
                         fact["supersedes_id"],
                     )
                     try:
-                        q = "SELECT * FROM c WHERE c.id = @id AND c.user_id = @uid"
+                        q = (
+                            "SELECT * FROM c WHERE c.id = @id AND c.user_id = @uid "
+                            "AND (NOT IS_DEFINED(c.superseded_by) OR IS_NULL(c.superseded_by))"
+                        )
                         results = list(
                             self._container.query_items(
                                 query=q,
@@ -486,7 +584,7 @@ class ProcessingPipeline:
                                 enable_cross_partition_query=True,
                             )
                         )
-                        if results and self._mark_superseded(results[0], det_id):
+                        if results and self._mark_superseded(results[0], det_id, reason="update"):
                             updated_count += 1
                     except Exception as exc:
                         logger.warning(
@@ -497,6 +595,9 @@ class ProcessingPipeline:
 
             docs_to_embed.append(doc)
             embed_texts.append(text)
+            # Record this fact's hash so a later candidate in the same batch
+            # with identical content also short-circuits.
+            existing_fact_hashes.add(new_content_hash)
 
         # ---- 6. Process procedural ----
         for proc in procedural:
@@ -512,7 +613,18 @@ class ProcessingPipeline:
                 )
                 continue
             content_hash = compute_content_hash(text)
-            det_id = f"proc_{hashlib.sha256(f'{user_id}:{content_hash}'.encode()).hexdigest()[:16]}"
+            # Same write-time exact-dedup short-circuit as facts. UPDATEs
+            # bypass — they explicitly target an old record by id.
+            if action == "ADD" and content_hash in existing_proc_hashes:
+                logger.debug(
+                    "extract_memories: skipping exact-dup procedural hash=%s user_id=%s",
+                    content_hash,
+                    user_id,
+                )
+                exact_dedup_skipped += 1
+                continue
+            seed = _ID_SEED_SEP.join((user_id, content_hash))
+            det_id = f"proc_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
 
             topic_tags = [f"topic:{t}" for t in proc.get("tags", [])]
             tags = ["sys:procedural", "sys:auto-extracted"] + topic_tags
@@ -542,9 +654,22 @@ class ProcessingPipeline:
             }
 
             if action == "UPDATE" and proc.get("supersedes_id"):
+                # Same self-overwrite guard as the fact UPDATE branch:
+                # if the new content hashes to the same det_id as the
+                # target, the upsert below would erase the audit
+                # metadata we are about to stamp on it.
+                if det_id == proc["supersedes_id"]:
+                    logger.debug(
+                        "extract_memories: skipping procedural UPDATE — det_id == supersedes_id (%s)",
+                        det_id,
+                    )
+                    continue
                 doc["supersedes_ids"] = [proc["supersedes_id"]]
                 try:
-                    q = "SELECT * FROM c WHERE c.id = @id AND c.user_id = @uid"
+                    q = (
+                        "SELECT * FROM c WHERE c.id = @id AND c.user_id = @uid "
+                        "AND (NOT IS_DEFINED(c.superseded_by) OR IS_NULL(c.superseded_by))"
+                    )
                     results = list(
                         self._container.query_items(
                             query=q,
@@ -555,7 +680,7 @@ class ProcessingPipeline:
                             enable_cross_partition_query=True,
                         )
                     )
-                    if results and self._mark_superseded(results[0], det_id):
+                    if results and self._mark_superseded(results[0], det_id, reason="update"):
                         updated_count += 1
                 except Exception as exc:
                     logger.warning(
@@ -566,6 +691,9 @@ class ProcessingPipeline:
 
             docs_to_embed.append(doc)
             embed_texts.append(text)
+            # Record this procedural's hash so a later candidate in the same
+            # batch with identical content also short-circuits.
+            existing_proc_hashes.add(content_hash)
 
         # ---- 7. Process episodic ----
         for ep in episodic:
@@ -580,7 +708,8 @@ class ProcessingPipeline:
                 continue
             text = f"{situation} → {action_taken} → {outcome}"
             content_hash = compute_content_hash(text)
-            det_id = f"ep_{hashlib.sha256(f'{user_id}:{thread_id}:{content_hash}'.encode()).hexdigest()[:16]}"
+            seed = _ID_SEED_SEP.join((user_id, thread_id, content_hash))
+            det_id = f"ep_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
 
             topic_tags = [f"topic:{t}" for t in ep.get("tags", [])]
             tags = ["sys:episodic", "sys:auto-extracted"] + topic_tags
@@ -626,7 +755,19 @@ class ProcessingPipeline:
             if not text:
                 continue
             content_hash = compute_content_hash(text)
-            det_id = f"unc_{hashlib.sha256(f'{user_id}:{thread_id}:{content_hash}'.encode()).hexdigest()[:16]}"
+            # Unclassified items are persisted as facts → share the fact
+            # bucket for the write-time exact-dedup short-circuit.
+            if content_hash in existing_fact_hashes:
+                logger.debug(
+                    "extract_memories: skipping exact-dup unclassified hash=%s user_id=%s thread_id=%s",
+                    content_hash,
+                    user_id,
+                    thread_id,
+                )
+                exact_dedup_skipped += 1
+                continue
+            seed = _ID_SEED_SEP.join((user_id, thread_id, content_hash))
+            det_id = f"unc_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
 
             topic_tags = [f"topic:{t}" for t in item.get("tags", [])]
             tags = ["sys:fact", "sys:auto-extracted", "sys:unclassified"] + topic_tags
@@ -654,6 +795,9 @@ class ProcessingPipeline:
 
             docs_to_embed.append(doc)
             embed_texts.append(text)
+            # Unclassified items are persisted as facts → record in the
+            # fact bucket so later batch candidates short-circuit.
+            existing_fact_hashes.add(content_hash)
 
         # ---- 9. Generate embeddings in batch ----
         if embed_texts:
@@ -674,6 +818,7 @@ class ProcessingPipeline:
             "episodic_count": sum(1 for d in docs_to_embed if d["type"] == "episodic"),
             "unclassified_count": sum(1 for d in docs_to_embed if "sys:unclassified" in d.get("tags", [])),
             "updated_count": updated_count,
+            "exact_dedup_skipped": exact_dedup_skipped,
         }
         logger.info("extract_memories completed: %s", result)
         return result
@@ -965,33 +1110,47 @@ class ProcessingPipeline:
         )
         return summary_doc
 
-    def deduplicate_facts(
-        self,
-        user_id: str,
-        similarity_threshold: float = 0.9,
-        max_facts: int = 200,
-    ) -> dict[str, int]:
-        """Deduplicate active facts for a user using cosine similarity + LLM.
+    def reconcile_memories(self, user_id: str, n: int = 50) -> dict[str, int]:
+        """Reconcile a user's active facts in a single LLM pass.
 
-        Returns counts: ``{"kept": N, "merged": N, "superseded": N}``.
+        Loads the most recent ``n`` active (non-superseded) facts for
+        ``user_id``, asks the dedup prompt to classify them into
+        ``duplicate_groups``, ``contradicted_pairs``, and ``kept_ids``, then
+        applies both kinds of resolutions:
+
+        * **Duplicates** — a fresh merged fact is upserted; every source is
+          soft-deleted with ``supersede_reason="duplicate"``.
+        * **Contradictions** — the loser is soft-deleted with
+          ``supersede_reason="contradiction"`` and ``superseded_by`` set to
+          the winner. Dangling references are resolved transparently when a
+          contradicted id was just absorbed into a duplicate group.
+
+        Returns ``{"kept": int, "merged": int, "contradicted": int}`` where
+        ``merged`` and ``contradicted`` count the *losers* that were
+        soft-deleted (duplicates and contradictions respectively).
         """
+        from .models import MemoryRecord, MemoryType
+
         if not user_id:
             raise ValidationError("user_id is required")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValidationError(f"n must be a positive integer, got {n!r}")
+        if n > 500:
+            raise ValidationError(f"n must be <= 500 to bound prompt size and LLM cost, got {n}")
 
-        logger.info("deduplicate_facts started user_id=%s threshold=%.2f", user_id, similarity_threshold)
+        logger.info("reconcile_memories started user_id=%s n=%d", user_id, n)
 
-        # ---- 1. Load all active facts ----
-        # ORDER BY c._ts DESC makes the TOP cap deterministic - without it
-        # Cosmos returns rows in implementation-defined order across physical
-        # partitions, so two near-duplicates on opposite sides of the cap
-        # would never get a chance to merge. Newest-first means recently
-        # extracted facts are always considered.
+        # ---- 1. Load up to N most recent active facts ----
+        # ORDER BY c.created_at DESC keeps the TOP cap deterministic across
+        # physical partitions and matches the dedup prompt's tiebreaker
+        # ("more recent created_at first"). Cosmos's _ts is the last-write
+        # timestamp, which would diverge from created_at after any UPDATE.
         query = (
-            f"SELECT TOP {max_facts} * FROM c "
+            f"SELECT TOP {n} * FROM c "
             "WHERE c.user_id = @user_id "
             "AND c.type = 'fact' "
-            "AND (NOT IS_DEFINED(c.superseded_by) OR c.superseded_by = null) "
-            "ORDER BY c._ts DESC"
+            "AND (NOT IS_DEFINED(c.superseded_by) OR IS_NULL(c.superseded_by)) "
+            "ORDER BY c.created_at DESC"
         )
         parameters: list[dict[str, Any]] = [
             {"name": "@user_id", "value": user_id},
@@ -1005,186 +1164,367 @@ class ProcessingPipeline:
         )
 
         if len(facts) <= 1:
-            logger.info("deduplicate_facts: %d facts, nothing to deduplicate", len(facts))
-            return {"kept": len(facts), "merged": 0, "superseded": 0}
+            logger.info(
+                "reconcile_memories: %d facts, nothing to reconcile",
+                len(facts),
+            )
+            return {"kept": len(facts), "merged": 0, "contradicted": 0}
 
-        # ---- 2. Compute pairwise cosine similarity ----
-        embeddings = [f.get("embedding") for f in facts]
-        # Filter out facts without embeddings
-        valid = [(i, f, e) for i, (f, e) in enumerate(zip(facts, embeddings)) if e]
-        if len(valid) <= 1:
-            return {"kept": len(facts), "merged": 0, "superseded": 0}
+        # ---- 2. Format the facts pool for the prompt ----
+        # ``json.dumps`` escapes embedded quotes and pipes inside content so
+        # the visual grammar (`| Field:` separators, `"<text>"` quoting)
+        # stays unambiguous even on adversarial inputs like
+        # ``She said "hi" | weird``. IDs are kept raw because they're
+        # deterministic alphanumerics — quoting them risks the LLM copying
+        # the quotes back into ``source_ids``.
+        lines: list[str] = []
+        for i, cf in enumerate(facts, 1):
+            content_quoted = json.dumps(cf.get("content", ""), ensure_ascii=False)
+            conf_raw = cf.get("confidence")
+            sal_raw = cf.get("salience")
+            conf_str = conf_raw if _is_real_number(conf_raw) else "N/A"
+            sal_str = sal_raw if _is_real_number(sal_raw) else "N/A"
+            created_raw = cf.get("created_at")
+            created_str = created_raw if created_raw else "N/A"
+            lines.append(
+                f"{i}. ID: {cf['id']} | Content: {content_quoted} | "
+                f"Confidence: {conf_str} | "
+                f"Salience: {sal_str} | "
+                f"Created: {created_str}"
+            )
+        facts_text = "\n".join(lines)
 
-        clusters = self._cluster_by_similarity(valid, similarity_threshold)
+        # ---- 3. Single LLM call over the entire pool ----
+        response_text = self._run_prompty(
+            "dedup.prompty",
+            inputs={"facts_text": facts_text},
+        )
+        parsed = self._parse_llm_json(response_text)
 
-        # ---- 3. For clusters with >1 fact, call LLM for dedup decisions ----
-        kept = 0
+        duplicate_groups = parsed.get("duplicate_groups", []) or []
+        contradicted_pairs = parsed.get("contradicted_pairs", []) or []
+        # ``kept_ids`` from the LLM is used below as a cross-check for
+        # accounting drift (hallucinated IDs, double-counting). The actual
+        # kept count is computed from facts minus consumed losers.
+        llm_kept_ids = list(parsed.get("kept_ids", []) or [])
+
+        facts_by_id: dict[str, dict[str, Any]] = {f["id"]: f for f in facts}
+
         merged = 0
-        superseded = 0
-        now = datetime.now(timezone.utc).isoformat()
+        contradicted = 0
+        # Tracks source_id -> merged_id rewrites so contradictions whose
+        # winner/loser landed in a duplicate group can be redirected to
+        # the surviving merged document. Only updated on *successful*
+        # supersede so stale redirects don't survive ETag races.
+        source_to_merged_id: dict[str, str] = {}
+        # Cache of merged docs we just upserted, keyed by merged_id. Lets
+        # the contradiction redirector reuse the in-memory dict instead of
+        # a cross-partition Cosmos round-trip for a doc we own. Also keeps
+        # the chain ETag-stable when the same merged doc absorbs both a
+        # duplicate group and a contradiction redirect in the same call.
+        merged_docs_by_id: dict[str, dict[str, Any]] = {}
+        # Set of source IDs that were *actually* superseded (counts toward
+        # ``merged``). Used by the kept-count cross-check below — earlier
+        # versions counted attempts and undercounted on ETag races.
+        consumed_source_ids: set[str] = set()
+        # Set of contradiction loser IDs that were *actually* superseded.
+        consumed_loser_ids: set[str] = set()
+        # Original-pool winner IDs from successfully-applied contradictions.
+        # The LLM emits winners under ``contradicted_pairs``, never under
+        # ``kept_ids`` — so the kept-cross-check at the end must subtract
+        # them from the expected-kept set or every clean run looks like a
+        # mismatch.
+        contradiction_winner_ids_in_pool: set[str] = set()
 
-        for cluster in clusters:
-            if len(cluster) == 1:
-                kept += 1
+        # ---- 4. Apply duplicate_groups FIRST ----
+        for group in duplicate_groups:
+            source_ids = list(group.get("source_ids") or [])
+            merged_content = group.get("merged_content")
+            if not merged_content or not source_ids:
+                logger.debug(
+                    "reconcile_memories: skipping malformed duplicate_group %r",
+                    group,
+                )
                 continue
 
-            # Build dedup prompt input
-            cluster_facts = [facts[idx] for idx in cluster]
-            lines = []
-            for i, cf in enumerate(cluster_facts, 1):
-                confidence = cf.get("confidence", "N/A")
-                lines.append(
-                    f'{i}. ID: {cf["id"]} | Content: "{cf.get("content", "")}" | '
-                    f"Confidence: {confidence} | "
-                    f"Salience: {cf.get('salience', 'N/A')} | "
-                    f"Created: {cf.get('created_at', 'N/A')}"
+            source_docs = [facts_by_id[sid] for sid in source_ids if sid in facts_by_id]
+            if not source_docs:
+                logger.debug(
+                    "reconcile_memories: duplicate_group references unknown ids %r",
+                    source_ids,
                 )
-            cluster_text = "\n".join(lines)
+                continue
 
-            response_text = self._run_prompty(
-                "dedup.prompty",
-                inputs={"cluster_text": cluster_text},
+            # Filtered, hallucination-free view of the source ids that
+            # actually exist in the pool. Used both for ``supersedes_ids``
+            # on the merged record and for the deterministic merged-id
+            # below so the merged doc faithfully represents reality.
+            valid_source_ids = [sid for sid in source_ids if sid in facts_by_id]
+
+            if len(valid_source_ids) < 2:
+                logger.debug(
+                    "reconcile_memories: skipping single-source duplicate_group %r",
+                    source_ids,
+                )
+                continue
+
+            # Sort source_docs by Cosmos _ts DESC so the merged record's
+            # partition (thread_id) is picked deterministically from the
+            # newest source — independent of the LLM's source_ids order.
+            source_docs.sort(key=lambda d: d.get("_ts", 0), reverse=True)
+
+            # Union tags across all source docs (preserve order, dedupe).
+            merged_tags: list[str] = []
+            seen_tags: set[str] = set()
+            for src in source_docs:
+                for t in src.get("tags", []) or []:
+                    if t not in seen_tags:
+                        seen_tags.add(t)
+                        merged_tags.append(t)
+            if not merged_tags:
+                merged_tags = ["sys:fact"]
+
+            # Union source_memory_ids across all source docs (provenance chain).
+            merged_source_memory_ids: list[str] = []
+            seen_smi: set[str] = set()
+            for src in source_docs:
+                for smi in src.get("source_memory_ids", []) or []:
+                    if smi not in seen_smi:
+                        seen_smi.add(smi)
+                        merged_source_memory_ids.append(smi)
+
+            # Transitive supersedes_ids: include any prior chain hops the
+            # source docs already absorbed so the merged record carries
+            # the full provenance, not just the immediate parent layer.
+            merged_supersedes: list[str] = []
+            seen_sup: set[str] = set()
+            for sid in valid_source_ids:
+                if sid not in seen_sup:
+                    seen_sup.add(sid)
+                    merged_supersedes.append(sid)
+            for src in source_docs:
+                for prior in src.get("supersedes_ids", []) or []:
+                    if prior and prior not in seen_sup:
+                        seen_sup.add(prior)
+                        merged_supersedes.append(prior)
+
+            # Newest source's thread_id wins (after _ts-desc sort above).
+            recent_thread_id = source_docs[0].get("thread_id", "")
+
+            # If LLM omitted confidence/salience, returned a non-positive
+            # placeholder, returned a JSON ``true`` masquerading as numeric,
+            # or returned an out-of-range value (e.g. 1.05 — common when
+            # models confuse percent with [0,1]), fall back to max across
+            # the source docs. Out-of-range without a fallback would let
+            # ``MemoryRecord(...)`` raise on Pydantic validation and the
+            # blanket except below would silently drop the entire group.
+            llm_conf = group.get("confidence")
+            confidence_val = (
+                float(llm_conf)
+                if _is_real_number(llm_conf) and 0 < llm_conf <= 1
+                else _max_or_none(src.get("confidence") for src in source_docs)
+            )
+            llm_sal = group.get("salience")
+            salience_val = (
+                float(llm_sal)
+                if _is_real_number(llm_sal) and 0 < llm_sal <= 1
+                else _max_or_none(src.get("salience") for src in source_docs)
             )
 
-            parsed = self._parse_llm_json(response_text)
-            actions = parsed.get("actions", [])
+            # Deterministic merged id keyed on (user, "merged", content_hash)
+            # so re-running reconcile on the same merged content produces an
+            # idempotent upsert instead of a fresh UUID each cycle. Stable
+            # ids also keep the supersede chain shallow: a future paraphrase
+            # that gets folded into the same canonical merged content will
+            # see the same id rather than chaining through a new UUID.
+            merged_content_hash = compute_content_hash(merged_content)
+            merged_id_seed = _ID_SEED_SEP.join((user_id, "merged", merged_content_hash))
+            merged_id = "fact_" + hashlib.sha256(merged_id_seed.encode()).hexdigest()[:32]
 
-            for act in actions:
-                action_type = act.get("action", "").upper()
+            try:
+                merged_record = MemoryRecord(
+                    id=merged_id,
+                    user_id=user_id,
+                    role="system",
+                    memory_type=MemoryType.fact,
+                    content=merged_content,
+                    thread_id=recent_thread_id or f"__reconciled__:{user_id}",
+                    confidence=confidence_val,
+                    salience=salience_val,
+                    supersedes_ids=merged_supersedes,
+                    source_memory_ids=merged_source_memory_ids,
+                    tags=merged_tags,
+                    content_hash=merged_content_hash,
+                    metadata={
+                        "merged_via": "reconcile",
+                        "merged_from_count": len(valid_source_ids),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "reconcile_memories: failed to build merged record for group %r",
+                    group,
+                )
+                continue
 
-                if action_type == "KEEP":
-                    kept += 1
+            # Generate embedding for the merged content so retrieval can
+            # rank it against future queries from the moment it lands.
+            # If embedding fails, abort this duplicate group entirely:
+            # writing a merged doc with no embedding and then superseding
+            # the sources would create a search-index hole until the next
+            # reconcile retried. Better to leave the duplicates in place.
+            try:
+                merged_record.embedding = self._embeddings.generate(merged_content)
+            except Exception:
+                logger.exception(
+                    "reconcile_memories: embedding failed for merged id=%s; "
+                    "aborting duplicate group to avoid search-index hole",
+                    merged_record.id,
+                )
+                continue
 
-                elif action_type == "MERGE":
-                    source_ids = act.get("source_ids", [])
-                    merged_text = act.get("merged_text", "")
-                    if not merged_text or not source_ids:
-                        continue
+            merged_doc = merged_record.to_cosmos_dict()
+            try:
+                merged_doc = self._upsert_memory(merged_doc)
+            except Exception:
+                logger.exception(
+                    "reconcile_memories: upsert failed for merged id=%s; aborting duplicate group",
+                    merged_record.id,
+                )
+                continue
+            merged_docs_by_id[merged_record.id] = merged_doc
 
-                    content_hash = compute_content_hash(merged_text)
-                    det_id = f"fact_{hashlib.sha256(f'{user_id}:merge:{content_hash}'.encode()).hexdigest()[:16]}"
-
-                    # Use the thread_id from the first source
-                    source_fact = next(
-                        (f for f in cluster_facts if f["id"] in source_ids),
-                        cluster_facts[0],
-                    )
-
-                    merged_tags: list[str] = []
-                    seen_tags: set[str] = set()
-                    for f in cluster_facts:
-                        if f["id"] not in source_ids:
-                            continue
-                        for t in f.get("tags", []):
-                            if t not in seen_tags:
-                                seen_tags.add(t)
-                                merged_tags.append(t)
-                    if not merged_tags:
-                        merged_tags = ["sys:fact"]
-
-                    source_confidences = [
-                        c for f in cluster_facts if f["id"] in source_ids and (c := f.get("confidence")) is not None
-                    ]
-                    merged_confidence = max(source_confidences) if source_confidences else None
-
-                    source_saliences = [
-                        s for f in cluster_facts if f["id"] in source_ids and (s := f.get("salience")) is not None
-                    ]
-                    merged_salience = act.get("salience")
-                    if merged_salience is None and source_saliences:
-                        merged_salience = max(source_saliences)
-
-                    merged_doc: dict[str, Any] = {
-                        "id": det_id,
-                        "user_id": user_id,
-                        "thread_id": source_fact.get("thread_id", ""),
-                        "role": "system",
-                        "type": "fact",
-                        "content": merged_text,
-                        "content_hash": content_hash,
-                        "metadata": {
-                            "merged_from": source_ids,
-                            "merged_from_count": len(source_ids),
-                        },
-                        "salience": merged_salience,
-                        "supersedes_ids": source_ids,
-                        "tags": merged_tags,
-                        "created_at": now,
-                    }
-                    if merged_confidence is not None:
-                        merged_doc["confidence"] = merged_confidence
-
-                    # Generate embedding for merged text
-                    merged_doc["embedding"] = self._embeddings.generate(merged_text)
-                    self._upsert_memory(merged_doc)
-
-                    # Mark source facts as superseded
-                    for sid in source_ids:
-                        src = next((f for f in cluster_facts if f["id"] == sid), None)
-                        if src and self._mark_superseded(src, det_id):
-                            superseded += 1
-
+            group_supersede_count = 0
+            for sid in valid_source_ids:
+                src_doc = facts_by_id.get(sid)
+                if src_doc is None:
+                    # Defensive — already filtered above, kept for clarity.
+                    continue
+                # Only update redirect/consumed-set on *successful* supersede.
+                # Losing the ETag race means another writer beat us; the
+                # source doc is still active from our perspective and should
+                # not be treated as consumed.
+                if self._mark_superseded(src_doc, merged_record.id, reason="duplicate"):
                     merged += 1
+                    group_supersede_count += 1
+                    source_to_merged_id[sid] = merged_record.id
+                    consumed_source_ids.add(sid)
 
-                elif action_type == "SUPERSEDE":
-                    old_id = act.get("old_id")
-                    new_id = act.get("new_id")
-                    if not old_id or not new_id:
-                        continue
+            # If every supersede attempt for this group failed (typically
+            # an ETag race against a concurrent reconcile that already
+            # superseded the same sources to the *same* deterministic
+            # merged id), do NOT delete the merged doc. A delete here
+            # would orphan the sources whose ``superseded_by`` already
+            # points at this merged id — they'd become invisible to
+            # default reads (filter ``superseded_by IS NULL``) and to the
+            # reconcile pool, causing permanent data loss. The merged doc
+            # is idempotent (deterministic id), so leaving it in place is
+            # consistent with whatever the winning concurrent writer
+            # produced.
+            if group_supersede_count == 0:
+                logger.info(
+                    "reconcile_memories: no sources superseded for merged id=%s "
+                    "(likely ETag race with concurrent reconcile); leaving "
+                    "merged doc in place — idempotent upsert is self-healing",
+                    merged_record.id,
+                )
 
-                    old_fact = next((f for f in cluster_facts if f["id"] == old_id), None)
-                    if old_fact and self._mark_superseded(old_fact, new_id):
-                        superseded += 1
+        # ---- 5. Apply contradicted_pairs SECOND with dangling-id resolution ----
+        for pair in contradicted_pairs:
+            winner_id = pair.get("winner_id")
+            loser_id = pair.get("loser_id")
+            if not winner_id or not loser_id:
+                logger.debug(
+                    "reconcile_memories: skipping malformed contradicted_pair %r",
+                    pair,
+                )
+                continue
 
-                    kept += 1  # the new_id is effectively kept
+            # Redirect through any duplicate-merge that absorbed the id.
+            resolved_winner = source_to_merged_id.get(winner_id, winner_id)
+            resolved_loser_id = source_to_merged_id.get(loser_id, loser_id)
 
-        result = {"kept": kept, "merged": merged, "superseded": superseded}
-        logger.info("deduplicate_facts completed: %s", result)
+            # Validate the (resolved) winner. The LLM is instructed never to
+            # invent IDs — if it does, refuse to write a dangling
+            # ``superseded_by`` pointer that breaks the audit trail.
+            if resolved_winner not in facts_by_id and resolved_winner not in merged_docs_by_id:
+                logger.warning(
+                    "reconcile_memories: hallucinated winner_id=%s (resolved=%s) "
+                    "not in pool or merged set; skipping pair %r",
+                    winner_id,
+                    resolved_winner,
+                    pair,
+                )
+                continue
+
+            if resolved_winner == resolved_loser_id:
+                # Both sides collapsed into the same merged doc — the
+                # contradiction is moot. Drop it silently.
+                logger.debug(
+                    "reconcile_memories: contradiction collapsed into duplicate group "
+                    "(winner=%s loser=%s -> %s); skipping",
+                    winner_id,
+                    loser_id,
+                    resolved_winner,
+                )
+                continue
+
+            loser_doc = facts_by_id.get(resolved_loser_id)
+            if loser_doc is None and resolved_loser_id != loser_id:
+                # The original loser was just merged. Reuse the in-memory
+                # merged doc so we skip a cross-partition re-fetch — we
+                # own the (user_id, thread_id) partition and just wrote
+                # it. This in-memory copy carries the ``_etag`` returned
+                # by ``_upsert_memory``'s captured upsert response, so
+                # the supersede below takes the ETag-protected
+                # ``replace_item`` branch — concurrency-safe against any
+                # other reconcile that may have touched the same merged
+                # id in parallel.
+                loser_doc = merged_docs_by_id.get(resolved_loser_id)
+
+            if loser_doc is None:
+                logger.warning(
+                    "reconcile_memories: loser doc not found for pair %r (resolved_loser=%s)",
+                    pair,
+                    resolved_loser_id,
+                )
+                continue
+
+            if self._mark_superseded(loser_doc, resolved_winner, reason="contradiction"):
+                contradicted += 1
+                # Track the *original* loser_id from the LLM so the kept
+                # cross-check below can reconcile against the input pool.
+                if loser_id in facts_by_id:
+                    consumed_loser_ids.add(loser_id)
+                # If the winner is an original pool member (not a freshly
+                # minted merged doc), record it so the kept-cross-check
+                # doesn't flag a clean run.
+                if winner_id in facts_by_id:
+                    contradiction_winner_ids_in_pool.add(winner_id)
+
+        # The pipeline's "kept" semantic = facts that survive as live
+        # records in the pool. The LLM's ``kept_ids`` semantic =
+        # everything *not* mentioned in duplicate_groups or
+        # contradicted_pairs. They differ by exactly the contradiction
+        # winners (winners survive but are listed under contradicted_pairs).
+        consumed_ids = consumed_source_ids | consumed_loser_ids
+        kept_actual = {fid for fid in facts_by_id.keys() if fid not in consumed_ids}
+        kept = len(kept_actual)
+        # Cross-check: the LLM's kept_ids set should equal kept_actual
+        # minus the contradiction winners. Mismatch usually means the LLM
+        # hallucinated an id or double-counted a fact across categories.
+        expected_llm_kept = kept_actual - contradiction_winner_ids_in_pool
+        llm_kept_set = {kid for kid in llm_kept_ids if kid in facts_by_id}
+        if llm_kept_set != expected_llm_kept:
+            symdiff = sorted(llm_kept_set ^ expected_llm_kept)[:10]
+            logger.info(
+                "reconcile_memories: kept_ids mismatch (llm=%d valid=%d, expected=%d). "
+                "Likely a hallucinated or double-counted fact id. Sample diff (≤10): %s",
+                len(llm_kept_ids),
+                len(llm_kept_set),
+                len(expected_llm_kept),
+                symdiff,
+            )
+        result = {"kept": kept, "merged": merged, "contradicted": contradicted}
+        logger.info("reconcile_memories completed: %s", result)
         return result
-
-    @staticmethod
-    def _cluster_by_similarity(
-        valid: list[tuple[int, dict[str, Any], list[float]]],
-        threshold: float,
-    ) -> list[list[int]]:
-        """Cluster facts by pairwise cosine similarity above *threshold*.
-
-        Uses a simple union-find approach. Returns lists of original indices.
-        """
-        n = len(valid)
-
-        def _cosine_sim(a: list[float], b: list[float]) -> float:
-            dot = sum(x * y for x, y in zip(a, b))
-            mag_a = math.sqrt(sum(x * x for x in a))
-            mag_b = math.sqrt(sum(x * x for x in b))
-            if mag_a == 0 or mag_b == 0:
-                return 0.0
-            return dot / (mag_a * mag_b)
-
-        # Union-find
-        parent = list(range(n))
-
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(x: int, y: int) -> None:
-            rx, ry = find(x), find(y)
-            if rx != ry:
-                parent[rx] = ry
-
-        # Compute pairwise similarity
-        for i in range(n):
-            for j in range(i + 1, n):
-                sim = _cosine_sim(valid[i][2], valid[j][2])
-                if sim >= threshold:
-                    union(i, j)
-
-        # Group by root
-        groups: dict[int, list[int]] = defaultdict(list)
-        for i in range(n):
-            groups[find(i)].append(valid[i][0])  # original index
-
-        return list(groups.values())

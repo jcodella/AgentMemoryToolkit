@@ -205,6 +205,19 @@ results = memory.search_cosmos("user preferences", user_id="u1", min_confidence=
 high_conf_facts = memory.get_memories(user_id="u1", memory_type="fact", min_confidence=0.7)
 ```
 
+### Memory Reconciliation
+
+`reconcile(user_id, n=50)` (on the public client; underlying pipeline method is `ProcessingPipeline.reconcile_memories`) collapses paraphrased duplicates and resolves semantic contradictions in a single LLM pass over the N most-recent active facts. Both outcomes soft-delete the loser with a `supersede_reason` of `"duplicate"` or `"contradiction"`. See [Docs/concepts.md](Docs/concepts.md#memory-reconciliation) for details.
+
+> **Cost note.** Each reconciliation makes one LLM call covering up to `n` facts (default 50, hard cap 500). With auto-trigger, this fires every `FACT_EXTRACTION_EVERY_N × DEDUP_EVERY_N` turns per user, with `n` taken from `DEDUP_POOL_SIZE`. The previous cosine-cluster pre-filter was removed deliberately — it could not catch semantic contradictions like "vegetarian" vs "ribeye steak" — so the LLM is now invoked whenever there are ≥ 2 active facts. To bound LLM cost more tightly: raise `DEDUP_EVERY_N` (lower frequency — reconcile fires every Nth extraction, so a *higher* N means *less often*), lower `DEDUP_POOL_SIZE` (smaller per-call pool), or override `n` per call when invoking `reconcile()` directly.
+
+| New `MemoryRecord` field | Meaning |
+|---|---|
+| `content_hash` | SHA-256 of normalized content; enables write-time exact-dedup short-circuit |
+| `supersede_reason` | `"duplicate"` or `"contradiction"` (None for live records) |
+| `superseded_at` | ISO timestamp when the supersede happened (None for live records) |
+| `superseded_by` | Id of the record that replaced this one (existing field) |
+
 ### Auto-trigger (per-turn extraction)
 
 By default, the **InProcess processor** runs each pipeline step independently as its own threshold trips inside `push_to_cosmos()`:
@@ -212,7 +225,8 @@ By default, the **InProcess processor** runs each pipeline step independently as
 | Env var | Default | Step that fires | Async behavior |
 |---|---|---|---|
 | `FACT_EXTRACTION_EVERY_N` | `1` (every turn) | `process_extract_memories` | scheduled via `asyncio.create_task` |
-| `DEDUP_EVERY_N` | `5` | `process_dedup` (fires every Nth extract → effectively every `FACT_EXTRACTION_EVERY_N × DEDUP_EVERY_N` turns) | scheduled via `asyncio.create_task` |
+| `DEDUP_EVERY_N` | `5` | `process_reconcile` (fires every Nth extract → effectively every `FACT_EXTRACTION_EVERY_N × DEDUP_EVERY_N` turns) | scheduled via `asyncio.create_task` |
+| `DEDUP_POOL_SIZE` | `50` | pool size (`n`) passed to `process_reconcile` from the auto-trigger; hard-capped at `500` | n/a (per-call) |
 | `THREAD_SUMMARY_EVERY_N` | `10` | `process_thread_summary` | scheduled via `asyncio.create_task` |
 | `USER_SUMMARY_EVERY_N` | `20` | `process_user_summary` | scheduled via `asyncio.create_task` |
 
