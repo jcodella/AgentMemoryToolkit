@@ -1,4 +1,4 @@
-# Azure Cosmos DB Agent Memory Toolkit
+# Azure Cosmos DB Agent Memory Toolkit - Public Preview
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -320,3 +320,6 @@ tests/                  Unit + integration tests (pytest)
 - **`agent_memory_toolkit.processing.ProcessingClient` is removed.** Drop the import and call `client.process_now()` (or `client.process_now_and_wait()`) instead. Same for the async `AsyncProcessingClient`.
 - **New `processor=` kwarg.** Defaults to `InProcessProcessor()` — existing code keeps its current behavior with no edits.
 - **`adf_endpoint` / `adf_key` constructor kwargs are gone.** The SDK no longer makes HTTP calls to the Function app at runtime; the Function app reads from the Cosmos change feed.
+
+## Trademark notice
+Trademarks This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft trademarks or logos is subject to and must follow Microsoft’s Trademark & Brand Guidelines. Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship. Any use of third-party trademarks or logos are subject to those third-party’s policies.
