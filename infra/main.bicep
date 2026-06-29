@@ -88,9 +88,6 @@ param maxBatchSize int = 20
 ])
 param memoryProcessorOwner string = 'durable'
 
-@description('Embed raw conversation turns on write so they can be vector-searched (search_turns()). The turns container is always provisioned with a vector index, so this only toggles whether embeddings are generated. Default false.')
-param enableTurnEmbeddings bool = false
-
 // --- Naming ---------------------------------------------------------------
 
 var abbrs = loadJsonContent('./abbreviations.json')
@@ -198,7 +195,6 @@ module functions 'modules/functions.bicep' = if (deployFunctionApp) {
     userSummaryEveryN: userSummaryEveryN
     maxBatchSize: maxBatchSize
     memoryProcessorOwner: memoryProcessorOwner
-    enableTurnEmbeddings: enableTurnEmbeddings
     tags: commonTags
   }
 }

@@ -765,9 +765,7 @@ class TestSearchCosmos:
         mem._embeddings_client = AsyncMock()
         mem._embeddings_client.generate = AsyncMock(return_value=[0.1, 0.2, 0.3])
 
-        results = await mem.search_turns(
-            search_terms="weather", user_id="u1", thread_id="t1", top_k=3
-        )
+        results = await mem.search_turns(search_terms="weather", user_id="u1", thread_id="t1", top_k=3)
 
         assert len(results) == 1
         mem._embeddings_client.generate.assert_awaited_once_with("weather")

@@ -44,6 +44,24 @@ logger = get_logger(__name__)
 
 _MEMORIES_TYPES: tuple[str, ...] = ("fact", "episodic", "procedural")
 
+# Explicit turn-document projection used by get_thread(). The raw conversation
+# log is the only place embeddings are stored on turns (when
+# enable_turn_embeddings=True), so we project every turn field *except*
+# ``embedding`` to keep the vector off the wire and out of the result.
+_TURN_PROJECTION_FIELDS: tuple[str, ...] = (
+    "id",
+    "user_id",
+    "thread_id",
+    "role",
+    "type",
+    "content",
+    "metadata",
+    "created_at",
+    "tags",
+    "ttl",
+)
+_TURN_PROJECTION: str = ", ".join(f"c.{field}" for field in _TURN_PROJECTION_FIELDS)
+
 
 def _validated_memories_types(memory_types: Optional[list[str]]) -> list[str]:
     types = list(memory_types) if memory_types else list(_MEMORIES_TYPES)
@@ -506,7 +524,7 @@ class MemoryStore:
         if not include_superseded:
             qb.add_is_null_or_undefined("c.superseded_by")
 
-        query = f"SELECT * FROM c{qb.build_where()} ORDER BY c.created_at DESC"
+        query = f"SELECT {_TURN_PROJECTION} FROM c{qb.build_where()} ORDER BY c.created_at DESC"
         logger.debug("get_thread query: %s", query)
         items = self._query_items(
             query=query,

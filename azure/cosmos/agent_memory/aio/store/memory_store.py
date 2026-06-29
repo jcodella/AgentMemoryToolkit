@@ -41,6 +41,7 @@ from azure.cosmos.agent_memory.store._search_helpers import (
     top_literal,
 )
 from azure.cosmos.agent_memory.store.memory_store import (
+    _TURN_PROJECTION,
     _validate_taggable_type,
     _validated_memories_types,
     _wrap_cosmos_exception,
@@ -492,7 +493,7 @@ class AsyncMemoryStore:
         if not include_superseded:
             qb.add_is_null_or_undefined("c.superseded_by")
 
-        query = f"SELECT * FROM c{qb.build_where()} ORDER BY c.created_at DESC"
+        query = f"SELECT {_TURN_PROJECTION} FROM c{qb.build_where()} ORDER BY c.created_at DESC"
         logger.debug("async get_thread query: %s", query)
         items = await self._query_items(
             query=query,

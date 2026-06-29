@@ -76,7 +76,6 @@ def get_pipeline():
     store = MemoryStore(
         containers=containers,
         embeddings_client=embeddings,
-        enable_turn_embeddings=config.get_enable_turn_embeddings(),
     )
     _pipeline = PipelineService(
         store,

@@ -42,7 +42,6 @@ class InProcessProcessor:
             from .._container_routing import ContainerKey
             from ..services.pipeline import PipelineService
             from ..store import MemoryStore
-            from ..thresholds import get_enable_turn_embeddings
 
             containers = {
                 ContainerKey.TURNS: turns_container,
@@ -52,7 +51,6 @@ class InProcessProcessor:
             store = MemoryStore(
                 containers=containers,
                 embeddings_client=embeddings_client,
-                enable_turn_embeddings=get_enable_turn_embeddings(),
             )
             pipeline = PipelineService(store, chat_client, embeddings_client, containers=containers)
 

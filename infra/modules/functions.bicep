@@ -92,9 +92,6 @@ param maxBatchSize int
 ])
 param memoryProcessorOwner string
 
-@description('Embed raw conversation turns on write so they can be vector-searched. The turns container is always provisioned with a vector index; this only toggles embedding generation. Default false.')
-param enableTurnEmbeddings bool = false
-
 @description('Tags to apply.')
 param tags object = {}
 
