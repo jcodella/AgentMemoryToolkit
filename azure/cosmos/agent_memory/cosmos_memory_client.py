@@ -279,7 +279,8 @@ class CosmosMemoryClient(_BaseMemoryClient):
             # Turns always carry the vector index (primed for search) but skip the
             # salience composite index, which only procedural synthesis needs.
             turns_vec_policy, turns_idx_policy, turns_ft_policy = _container_policies(
-                **_policy_kwargs, include_salience_composite=False
+                **{**_policy_kwargs, "vector_index_type": "quantizedFlat"},
+                include_salience_composite=False,
             )
             self._memories_container_client = db.create_container_if_not_exists(
                 **_build_container_kwargs(
@@ -658,7 +659,7 @@ class CosmosMemoryClient(_BaseMemoryClient):
     def search_turns(
         self,
         search_terms: str,
-        user_id: Optional[str] = None,
+        user_id: str,
         thread_id: Optional[str] = None,
         role: Optional[str] = None,
         hybrid_search: bool = False,
@@ -673,7 +674,9 @@ class CosmosMemoryClient(_BaseMemoryClient):
 
         Searches the turns container directly. Turns are strictly thread-scoped
         and only vector-searchable when ``enable_turn_embeddings`` was set when
-        the turns were written.
+        the turns were written. ``user_id`` is required so the search stays
+        within a single partition rather than fanning out across every user's
+        raw turns.
         """
         return self._get_store().search_turns(
             search_terms=search_terms,

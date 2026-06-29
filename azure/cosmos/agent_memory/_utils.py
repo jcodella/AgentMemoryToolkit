@@ -436,7 +436,7 @@ def _container_policies(
     distance_function: str,
     full_text_language: str,
     include_salience_composite: bool = True,
-    vector_index_type: str = "diskANN",
+    vector_index_type: str = "quantizedFlat",
 ) -> tuple[dict, dict, dict]:
     """Build the vector, indexing, and full-text policies for container creation.
 

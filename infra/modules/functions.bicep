@@ -329,10 +329,6 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           name: 'MEMORY_PROCESSOR_OWNER'
           value: memoryProcessorOwner
         }
-        {
-          name: 'ENABLE_TURN_EMBEDDINGS'
-          value: string(enableTurnEmbeddings)
-        }
       ]
     }
   }

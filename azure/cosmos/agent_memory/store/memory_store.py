@@ -901,7 +901,6 @@ class MemoryStore:
     def search_turns(
         self,
         search_terms: Optional[str] = None,
-        user_id: Optional[str] = None,
         thread_id: Optional[str] = None,
         role: Optional[str] = None,
         hybrid_search: bool = False,
@@ -912,12 +911,15 @@ class MemoryStore:
         created_after: Optional[str | datetime] = None,
         created_before: Optional[str | datetime] = None,
         *,
+        user_id: str,
         query: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Search raw conversation turns using vector similarity with optional hybrid ranking.
 
         Turns are strictly thread-scoped and only vector-searchable when turn
         embeddings were enabled at write time (see ``enable_turn_embeddings``).
+        ``user_id`` is required so the query is scoped to a single partition
+        instead of a cross-partition scan over every user's raw turns.
         """
         terms = require_search_terms(search_terms, query)
         _validate_hybrid_search(hybrid_search, terms)
