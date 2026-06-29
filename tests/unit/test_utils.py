@@ -231,7 +231,7 @@ def test_resolve_distance_function_invalid_raises(monkeypatch):
 
 def test_resolve_vector_index_type_defaults(monkeypatch):
     monkeypatch.delenv("AI_FOUNDRY_EMBEDDING_VECTOR_INDEX_TYPE", raising=False)
-    assert _resolve_vector_index_type(None) == "diskANN"
+    assert _resolve_vector_index_type(None) == "quantizedFlat"
 
 
 def test_resolve_vector_index_type_from_env(monkeypatch):
@@ -257,7 +257,7 @@ def test_container_policies_defaults_to_diskann():
         distance_function="cosine",
         full_text_language="en-US",
     )
-    assert indexing_policy["vectorIndexes"] == [{"path": "/embedding", "type": "diskANN"}]
+    assert indexing_policy["vectorIndexes"] == [{"path": "/embedding", "type": "quantizedFlat"}]
 
 
 def test_container_policies_uses_supplied_vector_index_type():

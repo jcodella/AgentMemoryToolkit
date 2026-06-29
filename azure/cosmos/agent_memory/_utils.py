@@ -260,13 +260,13 @@ def _resolve_distance_function(val: Optional[str]) -> str:
 def _resolve_vector_index_type(val: Optional[str]) -> str:
     """Resolve vector index type from explicit value or ``AI_FOUNDRY_EMBEDDING_VECTOR_INDEX_TYPE`` env var.
 
-    Defaults to ``diskANN``. Raises :class:`ConfigurationError` for unknown values.
+    Defaults to ``quantizedFlat``. Raises :class:`ConfigurationError` for unknown values.
 
-    ``diskANN`` requires the Cosmos DB account to have the DiskANN vector index
-    capability enabled. Accounts that do not (for example the classic Cosmos DB
-    emulator) can use ``quantizedFlat`` or ``flat`` instead.
+    ``quantizedFlat`` works on any Cosmos DB account (including the classic
+    emulator). ``diskANN`` requires the Cosmos DB account to have the DiskANN
+    vector index capability enabled; opt into it explicitly when available.
     """
-    raw = (val if val is not None else os.environ.get("AI_FOUNDRY_EMBEDDING_VECTOR_INDEX_TYPE") or "diskANN").strip()
+    raw = (val if val is not None else os.environ.get("AI_FOUNDRY_EMBEDDING_VECTOR_INDEX_TYPE") or "quantizedFlat").strip()
     if raw not in _ALLOWED_VECTOR_INDEX_TYPES:
         raise ConfigurationError(
             message=(
